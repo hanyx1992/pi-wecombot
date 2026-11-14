@@ -1,6 +1,6 @@
 {
   "name": "pi-wecombot",
-  "version": "1.1.12",
+  "version": "1.2.0",
   "type": "module",
   "description": "企业微信智能机器人 WebSocket 长连接扩展 for pi",
   "keywords": [
@@ -15,11 +15,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/huang-x-h/pi-wecombot.git"
+    "url": "git+https://github.com/hanyx1992/pi-wecombot.git"
   },
-  "homepage": "https://github.com/huang-x-h/pi-wecombot#readme",
+  "homepage": "https://github.com/hanyx1992/pi-wecombot#readme",
   "bugs": {
-    "url": "https://github.com/huang-x-h/pi-wecombot/issues"
+    "url": "https://github.com/hanyx1992/pi-wecombot/issues"
   },
   "pi": {
     "extensions": [
@@ -27,11 +27,23 @@
     ]
   },
   "peerDependencies": {
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-agent-core": "*",
-    "@mariozechner/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "^1.5.2"
   },
   "dependencies": {
     "aibot-node-sdk": "^1.0.3"
-  }
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "jiti": "^2.7.0",
+    "typescript": "^7.0.2",
+    "@earendil-works/pi-coding-agent": "1.5.2",
+    "typebox": "1.3.27"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "files": [
+    "index.ts"
+  ]
 }
