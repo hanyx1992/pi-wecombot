@@ -58,9 +58,9 @@ function bind(root, session = "session-1") {
       await events.get("session_start")({}, ctx);
       this.ws = clients.at(-1);
     },
-    text(content, user = "alice", chatid) {
+    text(content, user = "alice", chatid, reqId = Math.random().toString()) {
       this.ws.emit("message.text", {
-        headers: { req_id: Math.random().toString() },
+        headers: reqId ? { req_id: reqId } : undefined,
         body: {
           msgid: Math.random().toString(),
           chattype: chatid ? "group" : "single",
@@ -104,8 +104,9 @@ test("发送工具在机器人认证前可用，输入各投递一次且正文�
 test("独立消息准确选择单聊/群聊，等待回执并暴露发送失败", async (t) => {
   const h = await harness(t);
   await h.start();
-  h.text("/wecombot-disable", "alice");
-  h.text("hello", "bob", "group-1");
+  // 此场景验证无可用回调时的既有主动 Markdown 路径。
+  h.text("/wecombot-disable", "alice", undefined, null);
+  h.text("hello", "bob", "group-1", null);
   const send = h.tools.get("wecombot-send");
   const a = JSON.stringify(["bot", "single", "alice"]),
     g = JSON.stringify(["bot", "group", "group-1"]);
@@ -742,7 +743,7 @@ test("文件回执期间 new 发生时保留已发项并停止其余附件", asy
   assert.deepEqual(h.ws.uploads.map((x) => x.filename), ["confirmed.txt"]);
 });
 
-test("当前来源 Bot 向指定群聊按顺序发送独立文本和文件，成功等待最后回执", async (t) => {
+test("当前来源 Bot 群聊进展与独立附件回执后可同泡最终收尾", async (t) => {
   const h = await harness(t);
   await h.start();
   h.text("old bot");
@@ -765,21 +766,20 @@ test("当前来源 Bot 向指定群聊按顺序发送独立文本和文件，成
   const pending = h.tools.get("wecombot-attach").execute("attach", { chat, paths: [first, second] }).then((value) => { finished = true; return value; });
   await gate.started;
   assert.equal(finished, false);
-  assert.equal(h.ws.sent.length, 1);
+  assert.equal(h.ws.sent.length, 0);
   gate.release();
   const attached = await pending;
-  await h.tools.get("wecombot-send").execute("after", { chat, message: "after" });
+  await h.tools.get("wecombot-send").execute("after", { chat, message: "after", ending: "done" });
   assert.deepEqual(attached.details.sent, [first, second]);
   assert.deepEqual(h.ws.uploads, [
     { buffer: Buffer.from("report"), type: "file", filename: "report.txt" },
     { buffer: Buffer.from([0, 1, 127, 255]), type: "file", filename: "build.hap" },
   ]);
   assert.deepEqual(h.ws.sent, [
-    { chatid: "group-2", msgtype: "markdown", markdown: { content: "before" } },
     { chatid: "group-2", msgtype: "file", file: { media_id: "media-1" } },
     { chatid: "group-2", msgtype: "file", file: { media_id: "media-2" } },
-    { chatid: "group-2", msgtype: "markdown", markdown: { content: "after" } },
   ]);
+  assert.deepEqual(h.ws.streams.filter(x => x.finish).map(x => x.content), ["before", "✅after"]);
   assert.equal(old.uploads?.length || 0, 0);
   assert.equal(old.sent.length, 0);
   await assert.rejects(h.tools.get("wecombot-attach").execute("unknown", { chat: "unknown", paths: [first] }), /未知企微聊天标识/);
@@ -949,75 +949,40 @@ async function gatedJob(h) {
   });
 }
 
-test("done/question 正文成功后独立发送对应 emoji，最后回执前不成功", async (t) => {
-  for (const [ending, emoji] of [["done", "✅"], ["question", "💬"]]) await t.test(ending, async (t) => {
-    const h = await harness(t);
-    await h.start();
-    h.text("result", "bob", "group-1");
+test("无回调时done/question合并正文，等待单次实际回执", async (t) => {
+  for (const [ending, prefix] of [["done", "✅"], ["question", "💬"]]) await t.test(ending, async (t) => {
+    const h = await harness(t); await h.start(); h.text("result", "bob", "group-1", null);
     const calls = controlledSend(h.ws);
     let finished = false;
     const pending = h.tools.get("wecombot-send").execute("send", {
       chat: JSON.stringify(["bot", "group", "group-1"]), message: "正文", ending,
-    }).then((value) => { finished = true; return value; });
+    }).then(value => { finished = true; return value; });
+    assert.equal(calls[0].markdown.content, prefix + "正文");
+    await tick(); assert.equal(finished, false);
+    calls[0].confirm(); assert.match((await pending).content[0].text, /正文已发送/);
     assert.equal(calls.length, 1);
-    assert.equal(calls[0].markdown.content, "正文");
-    await tick();
-    assert.equal(finished, false);
-    assert.equal(calls.length, 1);
-    calls[0].confirm();
-    await tick();
-    assert.equal(finished, false);
-    assert.equal(calls.length, 2);
-    assert.equal(calls[1].chatid, calls[0].chatid);
-    assert.deepEqual(calls[1].markdown, { content: emoji });
-    assert.equal(calls[1].msgtype, "markdown");
-    calls[1].confirm();
-    const sent = await pending;
-    assert.equal(finished, true);
-    assert.match(sent.content[0].text, /正文已发送；收尾标记已发送/);
+    assert.equal(h.ws.streams.length, 0);
   });
 });
 
-test("正文拒绝或回执超时均不发送 emoji，保留原始错误", async (t) => {
+test("主动正文拒绝或回执超时保留原始错误，不再发送独立标记", async (t) => {
   for (const reason of [{ errcode: 500, errmsg: "blocked" }, new Error("Reply ack timeout")]) await t.test(String(reason.errmsg || reason.message), async (t) => {
-    const h = await harness(t);
-    await h.start(); h.text("result");
+    const h = await harness(t); await h.start(); h.text("result", "alice", undefined, null);
     const calls = controlledSend(h.ws);
     const pending = h.tools.get("wecombot-send").execute("send", { chat: alice, message: "正文", ending: "done" });
     calls[0].reject(reason);
-    await assert.rejects(pending, (err) => /正文发送未确认/.test(err.message)
-      && /收尾标记未发送/.test(err.message)
-      && /blocked|Reply ack timeout/.test(err.message));
+    await assert.rejects(pending, /blocked|Reply ack timeout/);
     assert.equal(calls.length, 1);
+    assert.equal(calls[0].markdown.content, "✅正文");
   });
 });
 
-test("emoji 失败或未确认保留正文成功，单独重试不重发正文", async (t) => {
-  for (const reason of [{ errcode: 400, errmsg: "denied" }, new Error("Reply ack timeout")]) await t.test(String(reason.errmsg || reason.message), async (t) => {
-    const h = await harness(t);
-    await h.start(); h.text("result");
-    const calls = controlledSend(h.ws), send = h.tools.get("wecombot-send");
-    const pending = send.execute("send", { chat: alice, message: "正文", ending: "question" });
-    calls[0].confirm(); await tick(); calls[1].reject(reason);
-    await assert.rejects(pending, (err) => /正文已发送/.test(err.message)
-      && /收尾标记发送未确认/.test(err.message) && /denied|Reply ack timeout/.test(err.message));
-    assert.equal(calls.length, 2);
-    const retry = send.execute("retry", { chat: alice, message: "💬" });
-    assert.equal(calls.length, 3);
-    assert.equal(calls[2].markdown.content, "💬");
-    calls[2].confirm(); await retry;
-    assert.equal(calls.length, 3);
-  });
-});
-
-test("正文等待期间取消、new、Pi 绑定和连接变化会停止 emoji，保留迟到成功回执", async (t) => {
-  for (const change of ["cancel", "new", "binding", "connection", "disconnect"]) await t.test(change, async (t) => {
-    const h = await harness(t);
-    await h.start(); h.text("result");
-    const old = h.ws, calls = controlledSend(old), controller = new AbortController();
-    const pending = h.tools.get("wecombot-send").execute("send", {
-      chat: alice, message: "正文", ending: "done",
-    }, controller.signal);
+test("A10 正文请求后的取消或切换保留迟到成功事实且不再续开", async (t) => {
+  for (const change of ["cancel", "new", "binding", "connection", "disconnect", "shutdown"]) await t.test(change, async (t) => {
+    const h = await harness(t); await h.start(); h.text("result"); await tick();
+    const old = h.ws, calls = controlledStreams(old), controller = new AbortController();
+    const pending = h.tools.get("wecombot-send").execute("send", { chat: alice, message: "正文" }, controller.signal);
+    await tick(); assert.equal(calls[0].content, "正文");
     if (change === "cancel") controller.abort();
     if (change === "new") h.text("/new");
     if (change === "binding") await bind(h.root, "session-1").start();
@@ -1026,29 +991,24 @@ test("正文等待期间取消、new、Pi 绑定和连接变化会停止 emoji�
       await h.commands.get("wecombot-enable").handler("", h.ctx);
     }
     if (change === "disconnect") old.emit("disconnected");
+    if (change === "shutdown") await h.events.get("session_shutdown")({}, h.ctx);
     calls[0].confirm();
-    await assert.rejects(pending, (err) => /取消|失效|连接已变化/.test(err.message)
-      && /正文已发送/.test(err.message) && /收尾标记未发送/.test(err.message));
-    assert.equal(calls.length, 1);
-    assert.equal(old.sent.length, 1);
-    if (change === "connection") assert.equal(clients.at(-1).sent.length, 0);
+    await assert.rejects(pending, err => /取消|失效|连接已变化/.test(err.message) && /正文已发送/.test(err.message));
+    await tick(); assert.equal(calls.length, 1);
+    if (change === "connection") assert.equal(clients.at(-1).streams.length, 0);
   });
 });
 
-test("发送前取消或切换失效的调用不发送正文，emoji 请求发出后的取消不抹掉回执", async (t) => {
-  const h = await harness(t);
-  await h.start(); h.text("result");
+test("发送前取消或切换失效不发送正文", async (t) => {
+  const h = await harness(t); await h.start(); h.text("result"); await tick();
   const controller = new AbortController(); controller.abort();
-  const send = h.tools.get("wecombot-send");
-  await assert.rejects(send.execute("cancelled", { chat: alice, message: "正文", ending: "done" }, controller.signal), /取消.*\n正文未发送\n收尾标记未发送/);
-  assert.equal(h.ws.sent.length, 0);
-  const calls = controlledSend(h.ws), later = new AbortController();
-  const pending = send.execute("send", { chat: alice, message: "正文", ending: "done" }, later.signal);
-  calls[0].confirm(); await tick(); later.abort(); calls[1].confirm();
-  assert.match((await pending).content[0].text, /收尾标记已发送/);
-  h.text("/new");
+  const send = h.tools.get("wecombot-send"), before = h.ws.streams.length;
+  await assert.rejects(send.execute("cancelled", { chat: alice, message: "正文", ending: "done" }, controller.signal), /取消.*\n正文未发送/);
+  assert.equal(h.ws.streams.length, before);
+  h.text("/new"); await tick();
+  const after = h.ws.streams.length;
   await assert.rejects(send.execute("old", { chat: alice, message: "正文" }), /会话已失效.*\n正文未发送/);
-  assert.equal(calls.length, 2);
+  assert.equal(h.ws.streams.length, after);
 });
 
 test("助手正文、agent_end 和 agent_settled 不自动生成收尾", async (t) => {
@@ -1221,4 +1181,490 @@ test("真实 spawn 启动失败仍记录错误并提交完成事件", async (t) 
   assert.equal(facts.signal, null);
   assert.equal(facts.log, "");
   assert.equal(h.ws.sent.length, 0);
+});
+
+
+test("A01 合法文本语音媒体立即占位，回执与下载均不阻塞输入", async (t) => {
+  const h = await harness(t); await h.start();
+  let ack;
+  h.ws.streamReply = () => new Promise((resolve) => { ack = resolve; });
+  h.text("开始");
+  assert.equal(h.inputs.length, 1);
+  await tick();
+  assert.equal(h.ws.streams[0]?.content, "处理中...");
+  assert.equal(h.ws.streams[0]?.finish, false);
+  h.text("补充");
+  assert.equal(h.inputs.length, 2);
+  ack({ errcode: 0 }); await tick();
+  assert.equal(h.ws.streams.length, 1);
+  h.ws.streamReply = undefined;
+  h.ws.emit("message.voice", { headers: { req_id: "voice" }, body: {
+    from: { userid: "bob" }, voice: { content: "语音任务" },
+  } });
+  let downloaded;
+  h.ws.download = () => new Promise((resolve) => { downloaded = resolve; });
+  h.ws.emit("message.image", { headers: { req_id: "media" }, body: {
+    from: { userid: "carol" }, image: { url: "https://fixture/image" },
+  } });
+  await tick();
+  assert.deepEqual(h.ws.streams.map(x => [x.headers.req_id === "voice" || x.headers.req_id === "media", x.content]), [
+    [false, "处理中..."], [true, "处理中..."], [true, "处理中..."],
+  ]);
+  assert.equal(h.inputs.length, 3);
+  downloaded({ buffer: Buffer.from("image") });
+  await until(() => h.inputs.length === 4);
+  assert.match(h.inputs.at(-1).content, /图片:/);
+});
+
+
+test("A03 A04 进展原位定格后接续，最终与提问合并前缀且不再占位", async (t) => {
+  const h = await harness(t); await h.start(); h.text("开始");
+  const send = h.tools.get("wecombot-send");
+  for (const message of ["收到，我先检查接口", "接口确认支持，正在核对限制", "限制已经查清，接下来验证客户端效果。"])
+    await send.execute("progress", { chat: alice, message });
+  await send.execute("final", { chat: alice, message: "结论: xxxxx", ending: "done" });
+  assert.deepEqual(h.ws.streams.map(x => [x.content, x.finish]), [
+    ["处理中...", false], ["收到，我先检查接口", true],
+    ["处理中...", false], ["接口确认支持，正在核对限制", true],
+    ["处理中...", false], ["限制已经查清，接下来验证客户端效果。", true],
+    ["处理中...", false], ["✅结论: xxxxx", true],
+  ]);
+  for (let i = 0; i < 8; i += 2) assert.equal(h.ws.streams[i].id, h.ws.streams[i+1].id);
+  assert.equal(new Set(h.ws.streams.map(x => x.id)).size, 4);
+  const firstReq = h.ws.streams[0].headers.req_id;
+  assert.ok(h.ws.streams.every(x => x.headers.req_id === firstReq));
+  h.text("再问"); await tick();
+  const out = await send.execute("question", { chat: alice, message: "选哪个？", ending: "question" });
+  assert.equal(h.ws.streams.at(-1).content, "💬选哪个？");
+  assert.equal(h.ws.streams.at(-1).finish, true);
+  assert.match(out.content[0].text, /已发送/);
+  assert.equal(h.ws.sent.length, 0);
+});
+
+function controlledStreams(ws) {
+  const calls = [];
+  ws.streamReply = (call) => new Promise((resolve, reject) => calls.push({ ...call, reject, confirm: () => resolve({ errcode: 0 }) }));
+  return calls;
+}
+test("A05 A06 快速回复等占位，正文确认后续开，不同 chat 独立且 ending 不吞新输入", async (t) => {
+  const h = await harness(t); await h.start();
+  const calls = controlledStreams(h.ws), send = h.tools.get("wecombot-send");
+  h.text("开始");
+  const progress = send.execute("fast", { chat: alice, message: "先查接口" });
+  await tick(); assert.equal(calls.length, 1);
+  calls[0].confirm(); await tick(); assert.equal(calls.length, 2);
+  h.text("另一任务", "bob", "group"); await tick();
+  assert.equal(calls.length, 3);
+  const groupReq = calls[2].headers.req_id;
+  calls[2].confirm(); calls[1].confirm(); await tick();
+  assert.equal(calls.length, 4); assert.equal(calls[3].content, "处理中...");
+  assert.equal(calls[3].headers.req_id, calls[0].headers.req_id);
+  assert.notEqual(groupReq, calls[3].headers.req_id);
+  calls[3].confirm(); await progress;
+  const done = send.execute("done", { chat: alice, message: "交付", ending: "done" });
+  await tick(); assert.equal(calls[4].content, "✅交付");
+  h.text("新增要求");
+  calls[4].confirm(); await done; await tick();
+  assert.equal(calls[5].content, "处理中...");
+  assert.notEqual(calls[5].headers.req_id, calls[4].headers.req_id);
+  calls[5].confirm(); await tick();
+  assert.equal(h.ws.sent.length, 0);
+});
+
+test("A07 虚拟三十分钟只在9/18/27分钟轮换，不调用模型且最终收尾", async (t) => {
+  const h = await harness(t); await h.start();
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  h.text("长任务"); await tick();
+  for (let minute = 1; minute <= 30; minute++) {
+    t.mock.timers.tick(60000); await tick();
+    const renewals = h.ws.streams.filter(x => x.content === "任务仍在进行中。");
+    assert.equal(renewals.length, Math.floor(minute / 9));
+  }
+  assert.equal(h.inputs.length, 1);
+  await h.tools.get("wecombot-send").execute("done", { chat: alice, message: "长任务完成", ending: "done" });
+  assert.deepEqual(h.ws.streams.map(x => [x.content, x.finish]), [
+    ["处理中...", false], ["任务仍在进行中。", true],
+    ["处理中...", false], ["任务仍在进行中。", true],
+    ["处理中...", false], ["任务仍在进行中。", true],
+    ["处理中...", false], ["✅长任务完成", true],
+  ]);
+  t.mock.timers.tick(600000); await tick(); assert.equal(h.ws.streams.length, 8);
+});
+
+test("A08 占位失败不丢输入，正文成功后续开失败仍成功", async (t) => {
+  const h = await harness(t); await h.start();
+  h.ws.streamReply = async () => { throw { errcode: 400, errmsg: "placeholder denied" }; };
+  h.text("任务"); await tick(); assert.equal(h.inputs.length, 1);
+  await h.tools.get("wecombot-send").execute("fallback", { chat: alice, message: "完整结论", ending: "done" });
+  assert.equal(h.ws.sent[0].markdown.content, "✅完整结论");
+  h.ws.streamReply = undefined; h.text("新任务"); await tick();
+  h.ws.streamReply = async call => { if (!call.finish) throw { errcode: 400, errmsg: "next denied" }; return { errcode: 0 }; };
+  const out = await h.tools.get("wecombot-send").execute("progress", { chat: alice, message: "阶段事实" });
+  assert.match(out.content[0].text, /正文已发送/);
+  assert.equal(h.ws.streams.filter(x => x.content === "阶段事实").length, 1);
+});
+
+test("A09 流正文明确拒绝只降级一次，超时不重发且停用旧req_id", async (t) => {
+  for (const mode of ["rejected", "timeout"]) await t.test(mode, async (t) => {
+    const h = await harness(t); await h.start(); h.text("任务"); await tick();
+    const req = h.ws.streams[0].headers.req_id;
+    h.ws.streamReply = async () => { throw mode === "rejected" ? { errcode: 400, errmsg: "stream invalid" } : new Error("Reply ack timeout"); };
+    const pending = h.tools.get("wecombot-send").execute("body", { chat: alice, message: "结论", ending: "done" });
+    if (mode === "rejected") {
+      assert.match((await pending).content[0].text, /已发送/);
+      assert.deepEqual(h.ws.sent.map(x => x.markdown.content), ["✅结论"]);
+    } else {
+      await assert.rejects(pending, /Reply ack timeout.*\n正文发送未确认/);
+      assert.equal(h.ws.sent.length, 0);
+      const before = h.ws.streams.length;
+      await h.tools.get("wecombot-send").execute("later", { chat: alice, message: "后续正文", ending: "question" });
+      assert.equal(h.ws.streams.length, before, `不能复用不确定的 ${req}`);
+      assert.deepEqual(h.ws.sent.map(x => x.markdown.content), ["💬后续正文"]);
+    }
+  });
+});
+
+test("A09 超过流字节上限保留完整正文，遗留占位可见中性结束", async (t) => {
+  const h = await harness(t); await h.start(); h.text("长正文"); await tick();
+  const message = "中".repeat(7000);
+  await h.tools.get("wecombot-send").execute("long", { chat: alice, message, ending: "done" });
+  assert.equal(h.ws.sent[0]?.markdown.content, "✅" + message);
+  assert.ok(h.ws.streams.every(x => Buffer.byteLength(x.content) <= 20480));
+  assert.equal(h.ws.streams.at(-1).finish, true);
+  assert.match(h.ws.streams.at(-1).content, /占位已停止/);
+});
+
+test("A07 自然进展重置九分钟时钟，轮换未确认停用来源且不再开流", async (t) => {
+  const h = await harness(t); await h.start();
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  h.text("开始"); await tick();
+  t.mock.timers.tick(8 * 60000); await tick();
+  await h.tools.get("wecombot-send").execute("progress", { chat: alice, message: "进展" });
+  t.mock.timers.tick(60000); await tick(); assert.equal(h.ws.streams.length, 3);
+  h.ws.streamReply = async () => { throw new Error("Reply ack timeout"); };
+  t.mock.timers.tick(8 * 60000); await tick();
+  assert.equal(h.ws.streams.length, 4);
+  assert.equal(h.ws.streams.at(-1).content, "任务仍在进行中。");
+  t.mock.timers.tick(30 * 60000); await tick(); assert.equal(h.ws.streams.length, 4);
+  await h.tools.get("wecombot-send").execute("final", { chat: alice, message: "结论", ending: "done" });
+  assert.equal(h.ws.streams.length, 4);
+  assert.equal(h.ws.sent[0].markdown.content, "✅结论");
+});
+
+test("A10 断线再认证与绑定替换后迟到占位ACK不续开，不复用旧回调", async (t) => {
+  for (const mode of ["disconnect", "binding"]) await t.test(mode, async (t) => {
+    const h = await harness(t); await h.start();
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+    const calls = controlledStreams(h.ws);
+    h.text("开始"); await tick();
+    if (mode === "disconnect") { h.ws.emit("disconnected"); h.ws.emit("authenticated"); }
+    else await bind(h.root, "session-1").start();
+    calls[0].confirm(); await tick();
+    t.mock.timers.tick(20 * 60000); await tick();
+    assert.equal(calls.filter(x => !x.finish).length, 1);
+    if (mode === "disconnect") assert.equal(calls.length, 1, "重连后不使用旧连接回调清理");
+    h.ws.streamReply = undefined;
+    const current = mode === "binding" ? bind(h.root, "session-1") : h;
+    if (mode === "binding") await current.start();
+    await current.tools.get("wecombot-send").execute("new", { chat: alice, message: "新回应", ending: "done" });
+    assert.equal(h.ws.sent.at(-1)?.markdown.content, "✅新回应");
+  });
+});
+
+test("A11 A13 idle后台维持占位，显式ending优先，提交结果自动重启且settled中性清理", async (t) => {
+  const h = await harness(t); await h.start(); h.text("后台任务"); await tick();
+  const task = await gatedJob(h);
+  await h.tools.get("wecombot-send").execute("wait", { chat: alice, message: "结果出来后回来" });
+  await h.events.get("agent_settled")?.({ aborted: false }, h.ctx); await tick();
+  assert.equal(h.ws.streams.at(-1).content, "处理中...");
+  await h.tools.get("wecombot-send").execute("done", { chat: alice, message: "当前请求已交付", ending: "done" });
+  await h.events.get("agent_settled")?.({ aborted: false }, h.ctx); await tick();
+  assert.equal(h.ws.streams.at(-1).content, "✅当前请求已交付");
+  await writeFile(join(h.root, "release"), "go");
+  await until(() => taskEvents(h).length === 1); await tick();
+  assert.equal(h.ws.streams.at(-1).content, "处理中...");
+  await h.events.get("turn_start")({}, h.ctx);
+  await h.events.get("agent_end")?.({}, h.ctx); await tick();
+  assert.equal(h.ws.streams.at(-1).content, "处理中...");
+  await h.events.get("agent_settled")?.({ aborted: false }, h.ctx); await tick();
+  assert.equal(h.ws.streams.at(-1).content, "本轮运行已结束。");
+  assert.ok(h.ws.streams.every(x => x.content !== "✅"));
+});
+
+test("A06 当前流保留原headers，续开使用最新输入回调", async (t) => {
+  const h = await harness(t); await h.start();
+  h.text("第一条", "alice", undefined, "original"); await tick();
+  h.text("补充", "alice", undefined, "latest"); await tick();
+  await h.tools.get("wecombot-send").execute("progress", { chat: alice, message: "进展" });
+  assert.deepEqual(h.ws.streams.map(x => x.headers.req_id), ["original", "original", "latest"]);
+});
+
+test("A10 new期间合法输入在新绑定投递并用其原回调占位", async (t) => {
+  const h = await harness(t); await h.start(); h.text("/new");
+  h.text("切换期间", "alice", undefined, "during-new");
+  let newer;
+  h.ctx.newSession = async ({ withSession }) => {
+    await h.events.get("session_shutdown")({}, h.ctx);
+    newer = bind(h.root, "session-2"); await newer.start();
+    await withSession({}); return { cancelled: false };
+  };
+  await h.commands.get("wecombot-new").handler("", h.ctx); await tick();
+  assert.equal(newer.inputs.length, 1);
+  assert.equal(h.ws.streams.at(-1)?.headers.req_id, "during-new");
+  assert.equal(h.ws.streams.at(-1)?.content, "处理中...");
+});
+
+test("A13 未下载完的媒体与已知待投递输入不会被settled提前关闭", async (t) => {
+  const h = await harness(t); await h.start();
+  let release;
+  h.ws.download = () => new Promise(resolve => { release = resolve; });
+  h.ws.emit("message.file", { headers: { req_id: "media-pending" }, body: {
+    from: { userid: "alice" }, file: { url: "https://fixture/file" },
+  } }); await tick();
+  await h.events.get("agent_settled")({ aborted: false }, h.ctx); await tick();
+  assert.equal(h.ws.streams.length, 1);
+  release({ buffer: Buffer.from("file") }); await until(() => h.inputs.length === 1);
+  h.ctx.hasPendingMessages = () => true;
+  await h.events.get("agent_settled")({ aborted: false }, h.ctx); await tick();
+  assert.equal(h.ws.streams.length, 1);
+  h.ctx.hasPendingMessages = () => false;
+  await h.events.get("turn_start")({}, h.ctx);
+  await h.events.get("agent_settled")({ aborted: true }, h.ctx); await tick();
+  assert.equal(h.ws.streams.at(-1).content, "本轮运行已中止。");
+  assert.equal(h.ws.streams.at(-1).finish, true);
+});
+
+test("A01 A02 非法空媒体、精确new与终端事件不制造工作占位", async (t) => {
+  const h = await harness(t); await h.start();
+  await h.events.get("before_agent_start")({ systemPrompt: "terminal" }, h.ctx);
+  await h.events.get("turn_start")({}, h.ctx);
+  await h.events.get("agent_settled")({ aborted: false }, h.ctx);
+  h.ws.emit("message.image", { headers: { req_id: "empty-image" }, body: { from: { userid: "alice" }, image: {} } });
+  h.ws.emit("message.text", { headers: { req_id: "empty-text" }, body: { from: { userid: "alice" }, text: { content: "" } } });
+  h.text("/new"); await tick();
+  assert.equal(h.ws.streams.length, 0);
+  assert.equal(h.inputs.length, 1);
+  assert.equal(h.inputs[0].content, "/wecombot-new");
+});
+
+test("A09 事件循环迟到导致流过期时走完整主动正文，24小时旧回调不再开流", async (t) => {
+  const h = await harness(t); await h.start();
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  h.text("开始"); await tick();
+  // 只推进挂钟，模拟事件循环未及时执行续期，而非让轮换计时器先执行。
+  t.mock.timers.setTime(11 * 60000 + 1000);
+  await h.tools.get("wecombot-send").execute("late", { chat: alice, message: "迟到结论", ending: "done" });
+  assert.deepEqual(h.ws.sent.map(x => x.markdown.content), ["✅迟到结论"]);
+  assert.equal(h.ws.streams.length, 1);
+  t.mock.timers.setTime(25 * 60 * 60000 + 1000);
+  h.text("无新回调输入", "alice", undefined, null); await tick();
+  assert.equal(h.ws.streams.length, 1);
+});
+
+test("A10 后续占位ACK期间取消停止轮换并保留正文成功", async (t) => {
+  const h = await harness(t); await h.start();
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  h.text("任务"); await tick();
+  let confirm;
+  h.ws.streamReply = call => call.finish ? Promise.resolve({ errcode: 0 }) : new Promise(resolve => { confirm = resolve; });
+  const controller = new AbortController();
+  const pending = h.tools.get("wecombot-send").execute("progress", { chat: alice, message: "阶段完成" }, controller.signal);
+  await tick();
+  assert.deepEqual(h.ws.streams.map(x => [x.content, x.finish]), [["处理中...",false],["阶段完成",true],["处理中...",false]]);
+  controller.abort(); confirm({ errcode: 0 });
+  const observed = await pending.then(value => ({ success: value.content[0].text }), err => ({ error: err.message }));
+  h.ws.streamReply = undefined;
+  t.mock.timers.tick(9 * 60000); await tick();
+  assert.match(observed.error || "", /取消.*\n正文已发送/);
+  assert.equal(h.ws.streams.filter(x => x.content === "任务仍在进行中。").length, 0);
+});
+
+test("A10 超限中性清理期间取消准确报告正文未发送", async (t) => {
+  const h = await harness(t); await h.start(); h.text("长正文"); await tick();
+  let confirm;
+  h.ws.streamReply = () => new Promise(resolve => { confirm = resolve; });
+  const controller = new AbortController();
+  const pending = h.tools.get("wecombot-send").execute("long", { chat: alice, message: "中".repeat(7000), ending: "done" }, controller.signal);
+  await tick();
+  assert.equal(h.ws.streams.at(-1).content, "本轮占位已停止。");
+  controller.abort(); confirm({ errcode: 0 });
+  const observed = await pending.then(value => ({ success: value.content[0].text }), err => ({ error: err.message }));
+  assert.match(observed.error || "", /取消.*\n正文未发送/);
+  assert.equal(h.ws.sent.length, 0);
+});
+
+test("A10 旧代媒体下载不维持新会话已settled的占位", async (t) => {
+  const h = await harness(t); await h.start();
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  let release;
+  h.ws.download = () => new Promise(resolve => { release = resolve; });
+  h.ws.emit("message.image", { headers: { req_id: "old-media" }, body: {
+    from: { userid: "alice" }, image: { url: "https://fixture/image" },
+  } }); await tick();
+  const newer = bind(h.root, "session-2"); await newer.start();
+  newer.text("新会话输入", "alice", undefined, "new-text"); await tick();
+  await newer.events.get("turn_start")({}, newer.ctx);
+  await newer.events.get("agent_settled")({ aborted: false }, newer.ctx); await tick();
+  release({ buffer: Buffer.from("old image") }); await tick(); await tick();
+  t.mock.timers.tick(9 * 60000); await tick();
+  const currentStreams = h.ws.streams.filter(x => x.headers.req_id === "new-text");
+  assert.equal(currentStreams.filter(x => x.content === "任务仍在进行中。").length, 0);
+  assert.equal(currentStreams.at(-1)?.finish, true);
+});
+
+test("A10 new排队输入的旧回调不在重连后复活", async (t) => {
+  const h = await harness(t); await h.start(); h.text("/new");
+  h.text("切换期间的输入", "alice", undefined, "pre-disconnect");
+  h.ws.emit("disconnected"); h.ws.emit("authenticated");
+  let newer;
+  h.ctx.newSession = async ({ withSession }) => {
+    await h.events.get("session_shutdown")({}, h.ctx);
+    newer = bind(h.root, "session-2"); await newer.start();
+    await withSession({}); return { cancelled: false };
+  };
+  await h.commands.get("wecombot-new").handler("", h.ctx); await tick();
+  assert.equal(newer.inputs.length, 1, "输入仍须投递给Pi");
+  assert.equal(h.ws.streams.filter(x => x.headers.req_id === "pre-disconnect").length, 0);
+});
+
+
+test("A16 Agent仍只需原四工具，发送参数保留chat/message/ending", async (t) => {
+  const h = await harness(t);
+  assert.deepEqual([...h.tools.keys()].sort(), ["wecombot-attach", "wecombot-send", "wecombot-start", "wecombot-task"]);
+  const send = h.tools.get("wecombot-send");
+  assert.deepEqual(Object.keys(send.parameters.properties).sort(), ["chat", "ending", "message"]);
+  assert.deepEqual(send.parameters.required, ["chat", "message"]);
+  const prompt = (await h.events.get("before_agent_start")({ systemPrompt: "base" }, h.ctx)).systemPrompt;
+  assert.match(prompt, /多步任务先调用 wecombot-send/);
+  assert.match(prompt, /配置的收尾前缀与正文合并发送/);
+  assert.doesNotMatch(prompt + send.description, /✅|💬/);
+  assert.doesNotMatch(prompt + send.description, /streamId|req_id|heartbeat|计时器|9 分钟|独立发送 ✅/);
+});
+
+test("配置文案贯穿首次占位、进展接续和两种收尾的流式及主动正文", async (t) => {
+  const h = await harness(t);
+  await writeFile(join(h.root, "wecom-bot.json"), JSON.stringify({
+    bots: [{ botId: "bot", secret: "secret" }],
+    messages: { working: "排查中...", donePrefix: "[完成] ", questionPrefix: "[提问] " },
+  }));
+  await h.start(); h.text("开始"); await tick();
+  const send = h.tools.get("wecombot-send");
+  await send.execute("progress", { chat: alice, message: "关键事实" });
+  await send.execute("question", { chat: alice, message: "选哪个？", ending: "question" });
+  h.text("继续"); await tick();
+  await send.execute("done", { chat: alice, message: "交付", ending: "done" });
+  assert.deepEqual(h.ws.streams.map(x => [x.content, x.finish]), [
+    ["排查中...", false], ["关键事实", true], ["排查中...", false], ["[提问] 选哪个？", true],
+    ["排查中...", false], ["[完成] 交付", true],
+  ]);
+  h.text("无回调", "bob", undefined, null);
+  const bob = JSON.stringify(["bot", "single", "bob"]);
+  await send.execute("active-done", { chat: bob, message: "主动结论", ending: "done" });
+  await send.execute("active-question", { chat: bob, message: "主动提问", ending: "question" });
+  assert.deepEqual(h.ws.sent.map(x => [x.chatid, x.markdown.content]), [
+    ["bob", "[完成] 主动结论"], ["bob", "[提问] 主动提问"],
+  ]);
+});
+
+test("文案逐字段校验、部分配置与显式空前缀保留", async (t) => {
+  const cases = [
+    { messages: { working: " \n\t", donePrefix: 42, questionPrefix: "问：" }, expected: ["处理中...", "✅结论", "问：问题"] },
+    { messages: { working: "中".repeat(6827), donePrefix: false, questionPrefix: null }, expected: ["处理中...", "✅结论", "💬问题"] },
+    { messages: { working: "排查中", donePrefix: "", questionPrefix: " " }, expected: ["排查中", "结论", " 问题"] },
+    { messages: { donePrefix: "完成：" }, expected: ["处理中...", "完成：结论", "💬问题"] },
+    { messages: { working: "", donePrefix: "a".repeat(20481), questionPrefix: "💬".repeat(5121) }, expected: ["处理中...", "✅结论", "💬问题"] },
+    ...[null, [], true, "bad"].map(messages => ({ messages, expected: ["处理中...", "✅结论", "💬问题"] })),
+  ];
+  for (const [i, { messages, expected }] of cases.entries()) await t.test(String(i), async (t) => {
+    const h = await harness(t);
+    await writeFile(join(h.root, "wecom-bot.json"), JSON.stringify({ bots: [{ botId: "bot", secret: "secret" }], messages }));
+    await h.start(); h.text("开始"); await tick();
+    const send = h.tools.get("wecombot-send");
+    await send.execute("done", { chat: alice, message: "结论", ending: "done" });
+    h.text("问题"); await tick();
+    await send.execute("question", { chat: alice, message: "问题", ending: "question" });
+    assert.deepEqual([h.ws.streams[0].content, ...h.ws.streams.filter(x => x.finish).map(x => x.content)], expected);
+    assert.equal(h.inputs.length, 2, "无效文案不丢弃合法Bot的输入");
+  });
+});
+
+test("Bot添加删除保存时保留原始messages与其他顶层字段", async (t) => {
+  const h = await harness(t);
+  const messages = { working: "检查中...", donePrefix: "", unknownFutureOption: { retained: true } };
+  const customMeta = { future: true };
+  const path = join(h.root, "wecom-bot.json");
+  await writeFile(path, JSON.stringify({ bots: [{ botId: "bot", secret: "secret" }], messages, customMeta }));
+  await h.start();
+  const inputs = ["第二个机器人", "bot2", "secret2"];
+  h.ctx.ui.input = async () => inputs.shift();
+  await h.commands.get("wecombot-add").handler("", h.ctx);
+  let saved = JSON.parse(await readFile(path, "utf8"));
+  assert.deepEqual(saved.messages, messages);
+  assert.deepEqual(saved.customMeta, customMeta);
+  assert.equal(saved.bots.length, 2);
+  h.ctx.ui.input = async () => "bot2";
+  await h.commands.get("wecombot-remove").handler("", h.ctx);
+  saved = JSON.parse(await readFile(path, "utf8"));
+  assert.deepEqual(saved.messages, messages, "不能写入默认questionPrefix覆盖用户的部分配置");
+  assert.deepEqual(saved.customMeta, customMeta);
+  assert.deepEqual(saved.bots, [{ botId: "bot", secret: "secret" }]);
+  h.ws = clients.at(-1);
+  h.text("使用保留设置"); await tick();
+  assert.equal(h.ws.streams[0].content, "检查中...");
+  await h.tools.get("wecombot-send").execute("done", { chat: alice, message: "完成", ending: "done" });
+  assert.equal(h.ws.streams.at(-1).content, "完成");
+});
+
+test("自定义工作文案用于九分钟轮换的新占位", async (t) => {
+  const h = await harness(t);
+  await writeFile(join(h.root, "wecom-bot.json"), JSON.stringify({
+    bots: [{ botId: "bot", secret: "secret" }], messages: { working: "检查中..." },
+  }));
+  await h.start();
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  h.text("长任务"); await tick();
+  t.mock.timers.tick(9 * 60000); await tick();
+  assert.deepEqual(h.ws.streams.map(x => [x.content, x.finish]), [
+    ["检查中...", false], ["任务仍在进行中。", true], ["检查中...", false],
+  ]);
+  assert.equal(h.inputs.length, 1, "轮换不唤醒模型");
+  await h.tools.get("wecombot-send").execute("done", { chat: alice, message: "完成", ending: "done" });
+});
+
+test("自定义工作文案用于显式收尾后的后台结果接续", async (t) => {
+  const h = await harness(t);
+  await writeFile(join(h.root, "wecom-bot.json"), JSON.stringify({
+    bots: [{ botId: "bot", secret: "secret" }], messages: { working: "后台处理中...", donePrefix: "完成：" },
+  }));
+  await h.start(); h.text("后台任务"); await tick();
+  await gatedJob(h);
+  await h.tools.get("wecombot-send").execute("done", { chat: alice, message: "当前回应已交付", ending: "done" });
+  await writeFile(join(h.root, "release"), "go");
+  await until(() => taskEvents(h).length === 1); await tick();
+  assert.deepEqual(h.ws.streams.map(x => [x.content, x.finish]), [
+    ["后台处理中...", false], ["完成：当前回应已交付", true], ["后台处理中...", false],
+  ]);
+  assert.notEqual(h.ws.streams[0].id, h.ws.streams[2].id);
+  await h.tools.get("wecombot-send").execute("result", { chat: alice, message: "后台结果", ending: "done" });
+  assert.equal(h.ws.streams.at(-1).content, "完成：后台结果");
+});
+
+test("明确拒绝降级仍保留配置前缀，拼接后超限正文完整主动发送", async (t) => {
+  for (const mode of ["refused", "combined-limit"]) await t.test(mode, async (t) => {
+    const h = await harness(t), prefix = mode === "refused" ? "完成：" : "a".repeat(20480);
+    await writeFile(join(h.root, "wecom-bot.json"), JSON.stringify({
+      bots: [{ botId: "bot", secret: "secret" }],
+      messages: { working: mode === "refused" ? "处理中..." : "w".repeat(20480), donePrefix: prefix },
+    }));
+    await h.start(); h.text("任务"); await tick();
+    if (mode === "refused") h.ws.streamReply = async call => {
+      if (call.content === "完成：x") throw { errcode: 400, errmsg: "stream invalid" };
+      return { errcode: 0 };
+    };
+    const out = await h.tools.get("wecombot-send").execute("body", { chat: alice, message: "x", ending: "done" });
+    assert.match(out.content[0].text, /正文已发送/);
+    assert.deepEqual(h.ws.sent.map(x => x.markdown.content), [prefix + "x"]);
+    assert.ok(h.ws.streams.every(x => Buffer.byteLength(x.content) <= 20480));
+    if (mode === "combined-limit") assert.equal(Buffer.byteLength(h.ws.sent[0].markdown.content), 20481);
+  });
 });

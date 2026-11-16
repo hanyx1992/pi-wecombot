@@ -5,6 +5,7 @@ export class WSClient extends EventEmitter {
     super();
     this.options = options;
     this.sent = [];
+    this.streams = [];
     clients.push(this);
   }
   connect() {
@@ -17,6 +18,12 @@ export class WSClient extends EventEmitter {
     if (this.sendFailure) throw this.sendFailure;
     if (this.sendWait) await this.sendWait;
     this.sent.push({ chatid, ...body });
+    return { errcode: 0 };
+  }
+  async replyStream(frame, id, content, finish = false) {
+    const call = { headers: { ...frame.headers }, id, content, finish };
+    this.streams.push(call);
+    if (this.streamReply) return this.streamReply(call);
     return { errcode: 0 };
   }
   async uploadMedia(buffer, options) {

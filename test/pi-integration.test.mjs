@@ -35,13 +35,21 @@ function completion(res, tool, args) {
   res.end("data: [DONE]\n\n");
 }
 
-for (const mode of ["busy", "idle"]) test(`真实 Pi 1.5.2：后台事件在 ${mode} 时被模型消费并通过工具回复`, { timeout: 15000 }, async (t) => {
+for (const [mode, title] of [
+  ["busy", "忙碌时接续后台结果"],
+  ["idle", "空闲时接续后台结果"],
+  ["ended", "显式收尾后后台结果另开占位"],
+  ["settled", "正常 settled 中性收闭"],
+  ["aborted", "真实中止后中性收闭"],
+  ["settled-input", "settled 期间新增输入保留工作占位"],
+]) test(`真实 Pi 1.5.2：${title}`, { timeout: 15000 }, async (t) => {
   const root = await mkdtemp(join(tmpdir(), "wecom-pi-"));
   const priorRoot = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = root;
   const beforeExit = new Set(process.listeners("exit"));
   const requests = [], errors = [], tools = new Map();
-  let session, ws, jobId, holdStarted = false, releaseHold;
+  let session, ws, jobId, holdStarted = false, releaseHold, injected = false;
+  const pendingAtInjection = [];
   const holding = new Promise((resolve) => { releaseHold = resolve; });
   const chat = JSON.stringify(["bot", "single", "alice"]);
   const server = createServer(async (req, res) => {
@@ -51,16 +59,25 @@ for (const mode of ["busy", "idle"]) test(`真实 Pi 1.5.2：后台事件在 ${m
       requests.push(JSON.parse(body));
       switch (requests.length) {
         case 1:
+          if (mode === "settled" || mode === "settled-input") { completion(res); break; }
+          if (mode === "aborted") { completion(res, "verification_hold", {}); break; }
           completion(res, "wecombot-start", {
             chat, description: `真实 Pi ${mode} 接续验证`,
             command: `while [ ! -f '${root}/release' ]; do sleep 0.01; done; echo build-output`,
           }); break;
         case 2:
-          if (mode === "busy") completion(res, "verification_hold", {});
+          if (mode === "busy" || mode === "settled-input") completion(res, "verification_hold", {});
+          else if (mode === "ended") completion(res, "wecombot-send", { chat, message: "当前回应已交付；后台完成后另行汇报", ending: "done" });
           else completion(res);
           break;
         case 3:
-          completion(res, "wecombot-send", { chat, message: `${mode}: 已读取后台结果`, ending: "done" }); break;
+          if (mode === "ended") completion(res);
+          else completion(res, "wecombot-send", { chat, message: mode === "settled-input" ? "已处理新增输入" : `${mode}: 已读取后台结果`, ending: "done" });
+          break;
+        case 4:
+          if (mode === "ended") completion(res, "wecombot-send", { chat, message: `${mode}: 已读取后台结果`, ending: "done" });
+          else completion(res);
+          break;
         default: completion(res);
       }
     } catch (err) { errors.push(err); res.destroy(); }
@@ -102,6 +119,16 @@ for (const mode of ["busy", "idle"]) test(`真实 Pi 1.5.2：后台事件在 ${m
     noExtensions: true, disabledBuiltinExtensions: ["mcp"],
     noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
     extensionFactories: [(pi) => {
+      // Earlier public handler injects input while Pi is emitting settlement,
+      // before the bot's settlement cleanup observes the new callback.
+      if (mode === "settled-input") pi.on("agent_settled", (_event, ctx) => {
+        if (injected) return;
+        injected = true;
+        ws.emit("message.text", { headers: { req_id: "settled-new-input" }, body: {
+          chattype: "single", from: { userid: "alice" }, text: { content: "settled期间新增输入" },
+        } });
+        pendingAtInjection.push(ctx.hasPendingMessages());
+      });
       extension({ ...pi, registerTool(tool) { tools.set(tool.name, tool); pi.registerTool(tool); } });
       pi.registerTool({
         name: "verification_hold", label: "Hold", description: "Local verification gate",
@@ -127,12 +154,49 @@ for (const mode of ["busy", "idle"]) test(`真实 Pi 1.5.2：后台事件在 ${m
   });
   await session.bindExtensions({ onError: (err) => errors.push(err) });
   ws = clients.at(-1);
-  ws.emit("message.text", { body: { chattype: "single", from: { userid: "alice" }, text: { content: "verify background" } } });
+  ws.emit("message.text", { headers: { req_id: `callback-${mode}` }, body: { chattype: "single", from: { userid: "alice" }, text: { content: "verify background" } } });
+  if (mode === "settled-input") {
+    await until(() => holdStarted);
+    assert.deepEqual(pendingAtInjection, [false], "真实 Pi 的文本 pending 查询不包含已提交的 custom 接续事件");
+    assert.match(JSON.stringify(requests[1].messages), /settled期间新增输入/);
+    assert.deepEqual(ws.streams.map(x => [x.content, x.finish]), [["处理中...", false]],
+      "旧回合 settled 不得收闭尚待消费的新输入占位");
+    releaseHold();
+    await until(() => requests.length === 4 && !session.isStreaming);
+    assert.deepEqual(ws.streams.map(x => [x.content, x.finish]), [
+      ["处理中...", false], ["✅已处理新增输入", true],
+    ]);
+    assert.equal(ws.streams[0].id, ws.streams[1].id);
+    assert.deepEqual(ws.sent, []);
+    assert.deepEqual(errors, []);
+    return;
+  }
+  if (mode === "settled" || mode === "aborted") {
+    if (mode === "aborted") {
+      await until(() => holdStarted);
+      const aborting = session.abort();
+      releaseHold();
+      await aborting;
+    } else await until(() => requests.length === 1 && !session.isStreaming);
+    await until(() => ws.streams.at(-1)?.finish);
+    assert.deepEqual(ws.streams.map(x => [x.content, x.finish]), [
+      ["处理中...", false],
+      [mode === "aborted" ? "本轮运行已中止。" : "本轮运行已结束。", true],
+    ]);
+    assert.equal(ws.streams[0].id, ws.streams[1].id);
+    assert.equal(ws.streams[1].headers.req_id, `callback-${mode}`);
+    assert.deepEqual(ws.sent, []);
+    assert.deepEqual(errors, []);
+    return;
+  }
   if (mode === "busy") {
     await until(() => holdStarted);
     assert.equal(session.isStreaming, true);
-  } else await until(() => requests.length === 2 && !session.isStreaming);
+  } else await until(() => requests.length === (mode === "ended" ? 3 : 2) && !session.isStreaming);
   assert.equal(ws.sent.length, 0);
+  assert.deepEqual(ws.streams.map(x => [x.content, x.finish]), mode === "ended"
+    ? [["处理中...", false], ["✅当前回应已交付；后台完成后另行汇报", true]]
+    : [["处理中...", false]], "后台仍活着时，显式 ending 停止当前接续链，其他情况保留占位");
   await writeFile(join(root, "release"), "go");
   await until(async () => (await tools.get("wecombot-task").execute("query", { id: jobId })).details.delivery === "submitted");
   if (mode === "busy") {
@@ -140,14 +204,25 @@ for (const mode of ["busy", "idle"]) test(`真实 Pi 1.5.2：后台事件在 ${m
     assert.equal(ws.sent.length, 0);
     releaseHold();
   }
-  await until(() => requests.length === 4 && !session.isStreaming);
-  const consumed = JSON.stringify(requests[2].messages);
+  await until(() => requests.length === (mode === "ended" ? 5 : 4) && !session.isStreaming);
+  const consumed = JSON.stringify(requests[mode === "ended" ? 3 : 2].messages);
   assert.match(consumed, /wecombot-task/);
   assert.match(consumed, /build-output/);
   assert.match(consumed, new RegExp(`真实 Pi ${mode} 接续验证`));
-  assert.deepEqual(ws.sent.map((x) => [x.chatid, x.markdown.content]), [
-    ["alice", `${mode}: 已读取后台结果`], ["alice", "✅"],
+  assert.deepEqual(ws.sent, []);
+  assert.deepEqual(ws.streams.map(x => [x.headers.req_id, x.content, x.finish]), [
+    ...(mode === "ended" ? [
+      [`callback-${mode}`, "处理中...", false],
+      [`callback-${mode}`, "✅当前回应已交付；后台完成后另行汇报", true],
+    ] : []),
+    [`callback-${mode}`, "处理中...", false],
+    [`callback-${mode}`, `✅${mode}: 已读取后台结果`, true],
   ]);
+  assert.equal(ws.streams[0].id, ws.streams[1].id);
+  if (mode === "ended") {
+    assert.notEqual(ws.streams[0].id, ws.streams[2].id);
+    assert.equal(ws.streams[2].id, ws.streams[3].id);
+  }
   assert.deepEqual(errors, []);
   const pkg = JSON.parse(await readFile(new URL("../node_modules/@earendil-works/pi-coding-agent/package.json", import.meta.url), "utf8"));
   assert.equal(pkg.version, "1.5.2");
