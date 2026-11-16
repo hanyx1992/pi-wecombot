@@ -75,11 +75,11 @@ const PROMPT = `
 [wecombot] 终端消息照常回复。企微消息须沿用来源 chat；输出正文对用户不可见，想让用户看到必须调 wecombot-send（发消息不结束任务）。
 
 像技术同事在企微打字那样边做边聊：短句直说、一次一件事，通常几句话说完，别写成带标题分点的长报告，不堆表情寒暄。
-- 简单问题直接答；多步任务先发一句开场说明第一步，不等全查完再开口。
+- 简单问题直接答；多步任务先调用 wecombot-send，简短确认收到并说明第一步，省略 ending，再调用其他工具。
 - 边查边同步：每确认一个关键事实、转向、阻塞或阶段产物，就先发一两句再查下一项（讲清结果、影响和下一步，不报流水账或空泛状态），别攒到最后连发。
 - 只有需要用户决定、暂时只能等待后台任务或最终交付时才结束本轮：拍板问题问清后停下等回复；收到补充要求先回应其内容再调整；最终只发结论和关键结果，细节等追问或改发文件，不机械拆条、不重复总结。
 
-wecombot-send 最终交付填 ending:"done"，需要用户回答或决定填 ending:"question"；扩展在正文成功后独立发送 ✅／❓，正文不要手动追加同一收尾 emoji。尚会自主继续或只等后台结果时省略 ending，等待时自然说明结果出来后会回来。done 只标记当前所回应请求已交付，正文仍须如实说明结果与限制；question 不取消其他已授权工作。
+wecombot-send 最终交付填 ending:"done"，需要用户回答或决定填 ending:"question"；扩展在正文成功后独立发送 ✅／💬，正文不要手动追加同一收尾 emoji。尚会自主继续或只等后台结果时省略 ending，等待时自然说明结果出来后会回来。done 只标记当前所回应请求已交付，正文仍须如实说明结果与限制；question 不取消其他已授权工作。
 
 用 wecombot-attach 独立发送本地文件，以回执为准，失败或“发送未确认”如实说明。编译等长命令用 wecombot-start 后台启动并填写简短用途 description，以继续响应新消息；完成事件会唤醒当前 Pi，结合原请求与日志接续并向原 chat 汇报，查状态或日志时调 wecombot-task 核实。精确 /new 由扩展处理并保留后台任务；跨会话的旧任务结果只汇报，可读现有日志，不自动修改代码、重跑或恢复旧工作，继续须由用户在新会话提出要求。`;
 
@@ -336,7 +336,7 @@ export default function (pi: ExtensionAPI) {
     name: "wecombot-send",
     label: "发送企微消息",
     description:
-      "向来源 chat 发送 Markdown 正文，等待企微回执。最终交付用 ending:done，需要用户答复用 question；正文成功后扩展独立发送 ✅/❓，正文勿重复追加。继续工作或等待后台时省略 ending。",
+      "向来源 chat 发送 Markdown 正文，等待企微回执。最终交付用 ending:done，需要用户答复用 question；正文成功后扩展独立发送 ✅/💬，正文勿重复追加。继续工作或等待后台时省略 ending。",
     parameters: Type.Object({
       chat: Type.String(),
       message: Type.String(),
@@ -373,7 +373,7 @@ export default function (pi: ExtensionAPI) {
           ending = "发送未确认";
           await ws.sendMessage(source.target, {
             msgtype: "markdown",
-            markdown: { content: params.ending === "done" ? "✅" : "❓" },
+            markdown: { content: params.ending === "done" ? "✅" : "💬" },
           });
           ending = "已发送";
         }

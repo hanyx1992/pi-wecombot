@@ -950,7 +950,7 @@ async function gatedJob(h) {
 }
 
 test("done/question 正文成功后独立发送对应 emoji，最后回执前不成功", async (t) => {
-  for (const [ending, emoji] of [["done", "✅"], ["question", "❓"]]) await t.test(ending, async (t) => {
+  for (const [ending, emoji] of [["done", "✅"], ["question", "💬"]]) await t.test(ending, async (t) => {
     const h = await harness(t);
     await h.start();
     h.text("result", "bob", "group-1");
@@ -1002,9 +1002,9 @@ test("emoji 失败或未确认保留正文成功，单独重试不重发正文",
     await assert.rejects(pending, (err) => /正文已发送/.test(err.message)
       && /收尾标记发送未确认/.test(err.message) && /denied|Reply ack timeout/.test(err.message));
     assert.equal(calls.length, 2);
-    const retry = send.execute("retry", { chat: alice, message: "❓" });
+    const retry = send.execute("retry", { chat: alice, message: "💬" });
     assert.equal(calls.length, 3);
-    assert.equal(calls[2].markdown.content, "❓");
+    assert.equal(calls[2].markdown.content, "💬");
     calls[2].confirm(); await retry;
     assert.equal(calls.length, 3);
   });
