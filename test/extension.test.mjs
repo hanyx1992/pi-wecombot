@@ -75,6 +75,86 @@ function bind(root, session = "session-1") {
 
 const tick = () => new Promise((r) => setImmediate(r));
 
+test("A21 新提问无需Agent干预就收尾旧占位并在新位置接续正文", async (t) => {
+  const h = await harness(t); await h.start();
+  h.text("第一问", "alice", undefined, "first-question"); await tick();
+  const send = h.tools.get("wecombot-send");
+  await send.execute("progress", { chat: alice, message: "已经找到记录，我继续核对" });
+  const old = h.ws.streams.at(-1);
+  h.text("第二问", "alice", undefined, "second-question");
+  assert.equal(h.inputs.length, 2, "换位回执不能阻塞投递输入");
+  await tick();
+  assert.deepEqual(h.ws.streams.slice(-2).map(x => [x.headers.req_id, x.content, x.finish]), [
+    ["first-question", "我接着看。", true],
+    ["second-question", "处理中...", false],
+  ], "没有任何Agent发言也应自动完成占位换位");
+  assert.equal(h.ws.streams.at(-2).id, old.id);
+  assert.notEqual(h.ws.streams.at(-1).id, old.id);
+  const current = h.ws.streams.at(-1);
+  await send.execute("answer", { chat: alice, message: "这是第二问的回答", ending: "done" });
+  assert.deepEqual(h.ws.streams.at(-1), {
+    headers: current.headers, id: current.id, content: "✅这是第二问的回答", finish: true,
+  });
+  assert.equal(h.ws.streams.filter(x => x.content === "已经找到记录，我继续核对").length, 1);
+  assert.equal(h.ws.sent.length, 0);
+});
+
+test("A24 continuation沿用messages配置，非法值回退且兼容旧配置", async (t) => {
+  for (const [name, value, expected] of [
+    ["custom", " 我接着弄。 ", " 我接着弄。 "],
+    ["missing", undefined, "我接着看。"],
+    ["empty", "", "我接着看。"],
+    ["whitespace", " \n\t", "我接着看。"],
+    ["wrong-type", 123, "我接着看。"],
+    ["utf8-limit", "看".repeat(6826) + "aa", "看".repeat(6826) + "aa"],
+    ["over-limit", "看".repeat(6827), "我接着看。"],
+  ]) await t.test(name, async (t) => {
+    const h = await harness(t);
+    await writeFile(join(h.root, "wecom-bot.json"), JSON.stringify({
+      bots: [{ botId: "bot", secret: "fixture-only" }],
+      messages: { working: "我在看", continuation: value, donePrefix: "完成：", questionPrefix: "问题：" },
+    }));
+    await h.start();
+    h.text("开始", "alice", undefined, "original"); await tick();
+    h.text("补充", "alice", undefined, "latest"); await tick();
+    assert.deepEqual(h.ws.streams.map(x => [x.content, x.finish]), [
+      ["我在看", false], [expected, true], ["我在看", false],
+    ]);
+    await h.tools.get("wecombot-send").execute("done", { chat: alice, message: "正文", ending: "done" });
+    assert.equal(h.ws.streams.at(-1).content, "完成：正文");
+    assert.equal(h.inputs.length, 2);
+  });
+});
+
+test("A23 语音和媒体在接收层换位，下载完成不重复换位且其他chat独立", async (t) => {
+  const h = await harness(t); await h.start();
+  h.text("开始", "alice", undefined, "first"); await tick();
+  h.ws.emit("message.voice", { headers: { req_id: "voice-next" }, body: {
+    from: { userid: "alice" }, voice: { content: "语音补充" },
+  } }); await tick();
+  assert.deepEqual(h.ws.streams.slice(-2).map(x => [x.headers.req_id, x.content]), [
+    ["first", "我接着看。"], ["voice-next", "处理中..."],
+  ]);
+  let downloaded;
+  h.ws.download = () => new Promise(resolve => { downloaded = resolve; });
+  h.ws.emit("message.image", { headers: { req_id: "image-next" }, body: {
+    from: { userid: "alice" }, image: { url: "https://fixture/image" },
+  } }); await tick();
+  assert.equal(h.inputs.length, 2, "媒体尚未下载完成");
+  assert.deepEqual(h.ws.streams.slice(-2).map(x => [x.headers.req_id, x.content]), [
+    ["voice-next", "我接着看。"], ["image-next", "处理中..."],
+  ]);
+  h.text("其他聊天", "bob", "group", "other-chat"); await tick();
+  assert.equal(h.ws.streams.filter(x => x.content === "我接着看。").length, 2);
+  downloaded({ buffer: Buffer.from("image") });
+  await until(() => h.inputs.length === 4); await tick();
+  assert.equal(h.ws.streams.filter(x => x.headers.req_id === "image-next").length, 1,
+    "下载完成后投递给Pi不能再次关闭/创建占位");
+  await h.tools.get("wecombot-send").execute("done", { chat: alice, message: "媒体已核对", ending: "done" });
+  assert.equal(h.ws.streams.at(-1).headers.req_id, "image-next");
+  assert.equal(h.ws.streams.at(-1).content, "✅媒体已核对");
+});
+
 test("发送工具在机器人认证前可用，输入各投递一次且正文不自动发送", async (t) => {
   const h = await harness(t);
   assert.ok(h.tools.has("wecombot-send"));
@@ -1196,8 +1276,10 @@ test("A01 合法文本语音媒体立即占位，回执与下载均不阻塞输�
   h.text("补充");
   assert.equal(h.inputs.length, 2);
   ack({ errcode: 0 }); await tick();
-  assert.equal(h.ws.streams.length, 1);
+  assert.equal(h.ws.streams[1].content, "我接着看。");
   h.ws.streamReply = undefined;
+  ack({ errcode: 0 }); await tick();
+  assert.equal(h.ws.streams.length, 3);
   h.ws.emit("message.voice", { headers: { req_id: "voice" }, body: {
     from: { userid: "bob" }, voice: { content: "语音任务" },
   } });
@@ -1208,7 +1290,8 @@ test("A01 合法文本语音媒体立即占位，回执与下载均不阻塞输�
   } });
   await tick();
   assert.deepEqual(h.ws.streams.map(x => [x.headers.req_id === "voice" || x.headers.req_id === "media", x.content]), [
-    [false, "处理中..."], [true, "处理中..."], [true, "处理中..."],
+    [false, "处理中..."], [false, "我接着看。"], [false, "处理中..."],
+    [true, "处理中..."], [true, "处理中..."],
   ]);
   assert.equal(h.inputs.length, 3);
   downloaded({ buffer: Buffer.from("image") });
@@ -1246,6 +1329,117 @@ function controlledStreams(ws) {
   ws.streamReply = (call) => new Promise((resolve, reject) => calls.push({ ...call, reject, confirm: () => resolve({ errcode: 0 }) }));
   return calls;
 }
+test("A22 正文排队及换位ACK期间新增输入，正文始终使用最新位置", async (t) => {
+  const h = await harness(t); await h.start();
+  const calls = controlledStreams(h.ws);
+  h.text("第一问", "alice", undefined, "first");
+  const body = h.tools.get("wecombot-send").execute("queued", { chat: alice, message: "合并回答", ending: "done" });
+  h.text("第二问", "alice", undefined, "second");
+  h.text("第三问", "alice", undefined, "third");
+  assert.equal(h.inputs.length, 3);
+  calls[0].confirm(); await tick();
+  assert.equal(calls[1].content, "我接着看。", "已排队正文不能抢先写入旧占位");
+  calls[1].confirm(); await tick();
+  assert.equal(calls[2].headers.req_id, "third", "合并尚未发出的过时建泡动作");
+  assert.equal(calls[2].content, "处理中...");
+  h.text("第四问", "alice", undefined, "fourth");
+  calls[2].confirm(); await tick();
+  assert.equal(calls[3].content, "我接着看。", "新占位ACK期间到达的输入也必须生效");
+  calls[3].confirm(); await tick();
+  assert.equal(calls[4].headers.req_id, "fourth");
+  calls[4].confirm(); await tick();
+  assert.equal(calls[5].content, "✅合并回答");
+  assert.equal(calls[5].id, calls[4].id);
+  assert.equal(calls[5].headers.req_id, "fourth");
+  calls[5].confirm(); await body; await tick();
+  assert.equal(calls.length, 7, "旧ending不能吞掉调用开始后新增输入的占位");
+  assert.equal(calls[6].content, "处理中...");
+  assert.equal(calls[6].headers.req_id, "fourth");
+  calls[6].confirm(); await tick();
+  assert.equal(h.ws.sent.length, 0);
+});
+test("A25 旧会话排队的换位动作不能关闭新会话的占位", async (t) => {
+  const h = await harness(t); await h.start();
+  const calls = controlledStreams(h.ws);
+  h.text("旧输入", "alice", undefined, "old");
+  h.text("旧排队输入", "alice", undefined, "old-queued");
+  const newer = bind(h.root, "session-2"); await newer.start();
+  newer.text("新输入", "alice", undefined, "new"); await tick();
+  const current = calls[1];
+  assert.equal(current.headers.req_id, "new");
+  newer.text("新补充", "alice", undefined, "new-latest");
+  calls[0].confirm(); await tick();
+  assert.equal(calls.some(x => x.id === current.id && x.finish), false,
+    "旧会话队列不能越过新会话正在等待的初始回执去关闭当前占位");
+  for (const call of calls.slice(2)) call.confirm(); await tick();
+  current.confirm(); await tick();
+  const close = calls.find(x => x.id === current.id && x.finish);
+  assert.equal(close.content, "我接着看。");
+  close.confirm(); await tick();
+  assert.equal(calls.at(-1).headers.req_id, "new-latest");
+  calls.at(-1).confirm(); await tick();
+  const sent = newer.tools.get("wecombot-send").execute("done", { chat: alice, message: "新回应", ending: "done" });
+  await tick(); calls.at(-1).confirm(); await sent;
+  assert.equal(calls.at(-1).content, "✅新回应");
+  assert.equal(calls.at(-1).headers.req_id, "new-latest");
+});
+test("A25 换位关闭失败或新占位失败不丢输入，正文不重复且回执保真", async (t) => {
+  for (const mode of ["old-close", "new-open"]) await t.test(mode, async (t) => {
+    const h = await harness(t); await h.start();
+    h.text("开始", "alice", undefined, "original"); await tick();
+    h.ws.streamReply = async call => {
+      if ((mode === "old-close" && call.content === "我接着看。") ||
+          (mode === "new-open" && call.headers.req_id === "latest" && !call.finish))
+        throw new Error("Reply ack timeout");
+      return { errcode: 0 };
+    };
+    h.text("补充", "alice", undefined, "latest"); await tick();
+    assert.equal(h.inputs.length, 2);
+    const sent = await h.tools.get("wecombot-send").execute("done", { chat: alice, message: "完整回答", ending: "done" });
+    assert.match(sent.content[0].text, /正文已发送/);
+    const bodies = [...h.ws.streams, ...h.ws.sent.map(x => ({ content: x.markdown?.content }))]
+      .filter(x => x.content === "✅完整回答");
+    assert.equal(bodies.length, 1);
+    assert.equal(h.ws.sent.length, mode === "new-open" ? 1 : 0);
+    if (mode === "old-close") assert.equal(bodies[0].headers.req_id, "latest");
+  });
+});
+
+test("A25 换位回执期间取消准确报告正文未发送，新输入仍保留占位", async (t) => {
+  const h = await harness(t); await h.start();
+  const calls = controlledStreams(h.ws), controller = new AbortController();
+  h.text("开始", "alice", undefined, "original");
+  const pending = h.tools.get("wecombot-send").execute("cancel", { chat: alice, message: "不应发送", ending: "done" }, controller.signal);
+  const rejected = assert.rejects(pending, /消息发送已取消\n正文未发送/);
+  h.text("新补充", "alice", undefined, "latest");
+  calls[0].confirm(); await tick();
+  assert.equal(calls[1].content, "我接着看。");
+  controller.abort();
+  calls[1].confirm(); await tick();
+  assert.equal(calls[2].headers.req_id, "latest");
+  calls[2].confirm(); await rejected; await tick();
+  assert.equal(calls.length, 3);
+  assert.equal(calls[2].finish, false);
+  assert.equal(h.ws.sent.length, 0);
+});
+
+test("A24 重读continuation不主动改泡，已开始的换位保留文案快照", async (t) => {
+  const h = await harness(t);
+  const config = continuation => JSON.stringify({ bots: [{ botId: "bot", secret: "fixture-only" }], messages: { continuation } });
+  await writeFile(join(h.root, "wecom-bot.json"), config("我接着弄。"));
+  await h.start(); h.text("开始", "alice", undefined, "original"); await tick();
+  const calls = controlledStreams(h.ws);
+  h.text("补充1", "alice", undefined, "second"); await tick();
+  assert.equal(calls[0].content, "我接着弄。");
+  await writeFile(join(h.root, "wecom-bot.json"), config("我继续处理。"));
+  await h.commands.get("wecombot-list").handler("", h.ctx);
+  assert.equal(calls.length, 1, "重读配置不主动改写或新建气泡");
+  calls[0].confirm(); await tick(); calls[1].confirm(); await tick();
+  h.text("补充2", "alice", undefined, "third"); await tick();
+  assert.equal(calls[2].content, "我继续处理。");
+  calls[2].confirm(); await tick(); calls[3].confirm(); await tick();
+  assert.equal(h.inputs.length, 3);
+});
 test("A05 A06 快速回复等占位，正文确认后续开，不同 chat 独立且 ending 不吞新输入", async (t) => {
   const h = await harness(t); await h.start();
   const calls = controlledStreams(h.ws), send = h.tools.get("wecombot-send");
@@ -1396,7 +1590,8 @@ test("A06 当前流保留原headers，续开使用最新输入回调", async (t)
   h.text("第一条", "alice", undefined, "original"); await tick();
   h.text("补充", "alice", undefined, "latest"); await tick();
   await h.tools.get("wecombot-send").execute("progress", { chat: alice, message: "进展" });
-  assert.deepEqual(h.ws.streams.map(x => x.headers.req_id), ["original", "original", "latest"]);
+  assert.deepEqual(h.ws.streams.map(x => x.headers.req_id), ["original", "original", "latest", "latest", "latest"]);
+  assert.deepEqual(h.ws.streams.map(x => x.content), ["处理中...", "我接着看。", "处理中...", "进展", "处理中..."]);
 });
 
 test("A10 new期间合法输入在新绑定投递并用其原回调占位", async (t) => {
@@ -1412,6 +1607,23 @@ test("A10 new期间合法输入在新绑定投递并用其原回调占位", asyn
   assert.equal(newer.inputs.length, 1);
   assert.equal(h.ws.streams.at(-1)?.headers.req_id, "during-new");
   assert.equal(h.ws.streams.at(-1)?.content, "处理中...");
+});
+
+test("A22 会话切换期间连续输入合并建泡，使用最新有效来源", async (t) => {
+  const h = await harness(t); await h.start(); h.text("/new");
+  h.text("切换时第一条", "alice", undefined, "during-first");
+  h.text("切换时第二条", "alice", undefined, "during-latest");
+  let newer;
+  h.ctx.newSession = async ({ withSession }) => {
+    await h.events.get("session_shutdown")({}, h.ctx);
+    newer = bind(h.root, "session-2"); await newer.start();
+    await withSession({}); return { cancelled: false };
+  };
+  await h.commands.get("wecombot-new").handler("", h.ctx); await tick();
+  assert.equal(newer.inputs.length, 2);
+  assert.deepEqual(h.ws.streams.map(x => [x.headers.req_id, x.content, x.finish]), [
+    ["during-latest", "处理中...", false],
+  ]);
 });
 
 test("A13 未下载完的媒体与已知待投递输入不会被settled提前关闭", async (t) => {
@@ -1590,7 +1802,7 @@ test("文案逐字段校验、部分配置与显式空前缀保留", async (t) =
 
 test("Bot添加删除保存时保留原始messages与其他顶层字段", async (t) => {
   const h = await harness(t);
-  const messages = { working: "检查中...", donePrefix: "", unknownFutureOption: { retained: true } };
+  const messages = { working: "检查中...", donePrefix: "", continuation: "我接着弄。", unknownFutureOption: { retained: true } };
   const customMeta = { future: true };
   const path = join(h.root, "wecom-bot.json");
   await writeFile(path, JSON.stringify({ bots: [{ botId: "bot", secret: "secret" }], messages, customMeta }));
@@ -1667,4 +1879,134 @@ test("明确拒绝降级仍保留配置前缀，拼接后超限正文完整主�
     assert.ok(h.ws.streams.every(x => Buffer.byteLength(x.content) <= 20480));
     if (mode === "combined-limit") assert.equal(Buffer.byteLength(h.ws.sent[0].markdown.content), 20481);
   });
+});
+
+test("工作期间list重读文案不重连，后续占位和新调用使用新配置，已发请求不改写", async (t) => {
+  const h = await harness(t); await h.start(); h.text("正在执行的任务"); await tick();
+  const clientCount = clients.length, calls = controlledStreams(h.ws);
+  const send = h.tools.get("wecombot-send"), path = join(h.root, "wecom-bot.json");
+  const progress = send.execute("progress", { chat: alice, message: "第一项事实" });
+  await tick();
+  assert.deepEqual(calls.map(x => [x.content, x.finish]), [["第一项事实", true]]);
+  await writeFile(path, JSON.stringify({ bots: [{ botId: "bot", secret: "secret" }], messages: {
+    working: "新工作文案A", donePrefix: "完成A：", questionPrefix: "提问A：",
+  } }));
+  await h.commands.get("wecombot-list").handler("", h.ctx);
+  assert.equal(clients.length, clientCount);
+  assert.equal(h.inputs.length, 1, "读取配置不触发模型新回合");
+  assert.equal(calls.length, 1, "读取配置不主动刷新已显示气泡");
+  calls[0].confirm(); await tick();
+  assert.deepEqual(calls.map(x => [x.content, x.finish]), [["第一项事实", true], ["新工作文案A", false]]);
+  calls[1].confirm(); await progress;
+  const done = send.execute("done", { chat: alice, message: "结论1", ending: "done" });
+  await tick(); assert.equal(calls[2].content, "完成A：结论1");
+  await writeFile(path, JSON.stringify({ bots: [{ botId: "bot", secret: "secret" }], messages: {
+    working: "新工作文案B", donePrefix: "完成B：", questionPrefix: "提问B：",
+  } }));
+  await h.commands.get("wecombot-list").handler("", h.ctx);
+  assert.equal(calls[2].content, "完成A：结论1", "已发出的正文等待ACK时保留原前缀");
+  calls[2].confirm(); await done;
+  h.text("新的提问"); await tick();
+  assert.equal(calls[3].content, "新工作文案B");
+  calls[3].confirm(); await tick();
+  const question = send.execute("question", { chat: alice, message: "要继续吗？", ending: "question" });
+  await tick(); assert.equal(calls[4].content, "提问B：要继续吗？");
+  calls[4].confirm(); await question;
+  assert.equal(clients.length, clientCount);
+  assert.equal(h.inputs.length, 2);
+  assert.deepEqual(h.ws.streams.map(x => [x.content, x.finish]), [
+    ["处理中...", false], ["第一项事实", true], ["新工作文案A", false],
+    ["完成A：结论1", true], ["新工作文案B", false], ["提问B：要继续吗？", true],
+  ]);
+});
+
+test("list重读在九分钟轮换中使用新工作文案，显式空前缀立即用于新收尾", async (t) => {
+  const h = await harness(t); await h.start();
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  h.text("仍在工作的长任务"); await tick();
+  const first = h.ws.streams[0], clientCount = clients.length;
+  t.mock.timers.tick(8 * 60000); await tick();
+  await writeFile(join(h.root, "wecom-bot.json"), JSON.stringify({
+    bots: [{ botId: "bot", secret: "secret" }],
+    messages: { working: "更新后的工作文案", donePrefix: "", questionPrefix: "" },
+  }));
+  await h.commands.get("wecombot-list").handler("", h.ctx);
+  assert.deepEqual(h.ws.streams.map(x => [x.content, x.finish]), [["处理中...", false]],
+    "命令不刷新已存在的占位，也不重置它的首次发送时间");
+  t.mock.timers.tick(60000); await tick();
+  assert.deepEqual(h.ws.streams.map(x => [x.content, x.finish]), [
+    ["处理中...", false], ["任务仍在进行中。", true], ["更新后的工作文案", false],
+  ]);
+  assert.equal(h.ws.streams[1].id, first.id);
+  assert.notEqual(h.ws.streams[2].id, first.id);
+  assert.equal(h.inputs.length, 1, "读取配置和轮换均不触发模型回合");
+  assert.equal(clients.length, clientCount);
+  const send = h.tools.get("wecombot-send");
+  await send.execute("done", { chat: alice, message: "长任务结果", ending: "done" });
+  assert.equal(h.ws.streams.at(-1).content, "长任务结果");
+  assert.equal(h.ws.streams.at(-1).finish, true);
+  h.text("需要用户选择"); await tick();
+  assert.equal(h.ws.streams.at(-1).content, "更新后的工作文案");
+  await send.execute("question", { chat: alice, message: "要继续吗？", ending: "question" });
+  assert.equal(h.ws.streams.at(-1).content, "要继续吗？");
+  const count = h.ws.streams.length;
+  t.mock.timers.tick(18 * 60000); await tick();
+  assert.equal(h.ws.streams.length, count, "空前缀不改变ending停止轮换的语义");
+});
+
+test("list重读部分配置和无效字段按项回退，主动正文保持新前缀并可恢复默认", async (t) => {
+  const h = await harness(t); await h.start(); h.text("无回调的既有聊天", "alice", undefined, null);
+  const path = join(h.root, "wecom-bot.json"), send = h.tools.get("wecombot-send"), clientCount = clients.length;
+  const partial = JSON.stringify({ bots: [{ botId: "bot", secret: "secret" }], messages: { donePrefix: "已完成：" } });
+  await writeFile(path, partial);
+  await h.commands.get("wecombot-list").handler("", h.ctx);
+  assert.equal(await readFile(path, "utf8"), partial, "查询命令不重写配置文件");
+  await send.execute("done1", { chat: alice, message: "第一项", ending: "done" });
+  await send.execute("question1", { chat: alice, message: "问题1", ending: "question" });
+  await writeFile(path, JSON.stringify({ bots: [{ botId: "bot", secret: "secret" }], messages: {
+    working: "   ", donePrefix: "", questionPrefix: false,
+  } }));
+  await h.commands.get("wecombot-list").handler("", h.ctx);
+  await send.execute("done2", { chat: alice, message: "第二项", ending: "done" });
+  await send.execute("question2", { chat: alice, message: "问题2", ending: "question" });
+  await writeFile(path, JSON.stringify({ bots: [{ botId: "bot", secret: "secret" }] }));
+  await h.commands.get("wecombot-list").handler("", h.ctx);
+  await send.execute("done3", { chat: alice, message: "第三项", ending: "done" });
+  await send.execute("question3", { chat: alice, message: "问题3", ending: "question" });
+  assert.deepEqual(h.ws.sent.map(x => [x.chatid, x.markdown.content]), [
+    ["alice", "已完成：第一项"], ["alice", "💬问题1"], ["alice", "第二项"],
+    ["alice", "💬问题2"], ["alice", "✅第三项"], ["alice", "💬问题3"],
+  ]);
+  assert.equal(h.ws.streams.length, 0, "无有效回调不会因重读配置伪造工作占位");
+  assert.equal(clients.length, clientCount);
+  assert.equal(h.inputs.length, 1);
+});
+
+test("重读前已排队的调用保留旧前缀，重读后开始的调用采用新配置", async (t) => {
+  const h = await harness(t); await h.start(); h.text("开始工作"); await tick();
+  const calls = controlledStreams(h.ws), send = h.tools.get("wecombot-send");
+  const progress = send.execute("progress", { chat: alice, message: "第一阶段" });
+  await tick(); assert.equal(calls[0].content, "第一阶段");
+  const queued = send.execute("queued", { chat: alice, message: "已排队的结论", ending: "done" });
+  await tick(); assert.equal(calls.length, 1, "第二调用尚未发往SDK，正等前一正文ACK");
+  await writeFile(join(h.root, "wecom-bot.json"), JSON.stringify({ bots: [{ botId: "bot", secret: "secret" }], messages: {
+    working: "重读后的工作文案", donePrefix: "新完成：", questionPrefix: "新提问：",
+  } }));
+  await h.commands.get("wecombot-list").handler("", h.ctx);
+  assert.equal(calls.length, 1);
+  calls[0].confirm(); await tick();
+  assert.equal(calls[1].content, "重读后的工作文案", "重读后新开的气泡使用新文案");
+  calls[1].confirm(); await progress; await tick();
+  assert.equal(calls[2].content, "✅已排队的结论", "重读不改写此前已开始的调用");
+  assert.equal(calls[1].id, calls[2].id);
+  calls[2].confirm(); await queued;
+  h.text("重读后新的请求"); await tick();
+  calls[3].confirm(); await tick();
+  const afterReload = send.execute("after-reload", { chat: alice, message: "新结论", ending: "done" });
+  await tick(); assert.equal(calls[4].content, "新完成：新结论");
+  calls[4].confirm(); await afterReload;
+  assert.deepEqual(h.ws.streams.map(x => [x.content, x.finish]), [
+    ["处理中...", false], ["第一阶段", true], ["重读后的工作文案", false],
+    ["✅已排队的结论", true], ["重读后的工作文案", false], ["新完成：新结论", true],
+  ]);
 });

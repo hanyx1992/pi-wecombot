@@ -17,6 +17,7 @@ interface Bot {
 }
 interface Bubble {
   id: string;
+  inputRevision?: number;
   frame: { headers: { req_id: string }; receivedAt: number; unusable?: boolean };
   ws: WSClient;
   connection: number;
@@ -31,7 +32,8 @@ interface Chat {
   callback?: Bubble["frame"];
   bubble?: Bubble;
   queue?: Promise<unknown>;
-  revision?: number;
+  revision?: number; // 任意接续活动，保护调用开始后的新工作。
+  inputRevision?: number; // 仅用户消息到达时推进，决定气泡的显示位置。
   active?: boolean;
   pending?: boolean;
   downloads?: { count: number };
@@ -72,11 +74,13 @@ interface MessageText {
   working: string;
   donePrefix: string;
   questionPrefix: string;
+  continuation: string;
 }
 const DEFAULT_MESSAGES: MessageText = {
   working: "处理中...",
   donePrefix: "✅",
   questionPrefix: "💬",
+  continuation: "我接着看。",
 };
 interface State {
   bots: Bot[];
@@ -135,6 +139,7 @@ export default function (pi: ExtensionAPI) {
   };
   state.connection ??= 0;
   state.messages ??= { ...DEFAULT_MESSAGES };
+  state.messages.continuation ??= DEFAULT_MESSAGES.continuation;
   if (!cache[key]) {
     cache[key] = state;
     process.once("exit", () => {
@@ -150,10 +155,10 @@ export default function (pi: ExtensionAPI) {
   function messageText(value: unknown): MessageText {
     const messages = { ...DEFAULT_MESSAGES };
     if (typeof value !== "object" || value === null || Array.isArray(value)) return messages;
-    for (const field of ["working", "donePrefix", "questionPrefix"] as const) {
+    for (const field of ["working", "donePrefix", "questionPrefix", "continuation"] as const) {
       const text = (value as Record<string, unknown>)[field];
       if (typeof text === "string" && Buffer.byteLength(text, "utf8") <= 20480 &&
-          (field !== "working" || text.trim())) messages[field] = text;
+          ((field !== "working" && field !== "continuation") || text.trim())) messages[field] = text;
     }
     return messages;
   }
@@ -238,7 +243,7 @@ export default function (pi: ExtensionAPI) {
     ws.on("message.text", (frame) => {
       const chat = source(frame);
       const text = frame.body?.text?.content;
-      if (chat && text) receive(chat, text, true);
+      if (chat && text) receive(chat, text, "text");
     });
     ws.on("message.voice", (frame) => {
       const chat = source(frame);
@@ -262,7 +267,7 @@ export default function (pi: ExtensionAPI) {
       const sourceChat = state.chats.get(chat)!;
       const downloads = sourceChat.downloads ??= { count: 0 };
       downloads.count++;
-      activateChat(chat);
+      activateChat(chat, true);
       const parts: string[] = [];
       try {
         for (const item of items) {
@@ -296,7 +301,7 @@ export default function (pi: ExtensionAPI) {
             parts.push(`${item.msgtype} 下载失败: ${error(err)} (${data.url})`);
           }
         }
-        if (current() && parts.length) receive(chat, parts.join("\n"));
+        if (current() && parts.length) receive(chat, parts.join("\n"), "media");
       } finally {
         downloads.count--;
       }
@@ -366,10 +371,13 @@ export default function (pi: ExtensionAPI) {
     }
   }
   async function openBubble(chat: Chat, ws: WSClient, epoch: number) {
+    if (state.ws !== ws || state.epoch !== epoch) return;
+    if (chat.bubble && chat.bubble.inputRevision !== chat.inputRevision)
+      await closeBubble(chat, chat.bubble, state.messages.continuation);
     if (chat.bubble || !chat.callback || chat.callback.unusable ||
         Date.now() - chat.callback.receivedAt >= 24 * 60 * 60_000 || state.ws !== ws || state.epoch !== epoch ||
         !state.connected || !state.binding || state.switching) return;
-    const bubble: Bubble = { id: randomUUID(), frame: chat.callback, ws, epoch, connection: state.connection, startedAt: Date.now() };
+    const bubble: Bubble = { id: randomUUID(), inputRevision: chat.inputRevision, frame: chat.callback, ws, epoch, connection: state.connection, startedAt: Date.now() };
     chat.bubble = bubble;
     try {
       await ws.replyStream(bubble.frame, bubble.id, state.messages.working, false);
@@ -397,11 +405,12 @@ export default function (pi: ExtensionAPI) {
       console.error("[wecombot] 占位创建失败:", error(err));
     }
   }
-  function activateChat(id: string) {
+  function activateChat(id: string, newUserInput = false) {
     const chat = state.chats.get(id);
     const ws = state.ws, epoch = state.epoch;
     if (!chat) return;
     chat.revision = (chat.revision || 0) + 1;
+    if (newUserInput) chat.inputRevision = (chat.inputRevision || 0) + 1;
     chat.active = true;
     chat.pending = true;
     if (!chat.callback || !ws || !state.connected || !state.binding || state.switching) return;
@@ -418,7 +427,7 @@ export default function (pi: ExtensionAPI) {
       { triggerTurn: true, deliverAs: "steer" },
     );
   }
-  function receive(chat: string, text: string, allowNew = false) {
+  function receive(chat: string, text: string, kind: "text" | "voice" | "media" = "voice") {
     if (!state.binding && !state.switching) {
       void send(chat, "Pi会话不可用，请重启Pi；本条输入未处理。").catch(
         (err) => {
@@ -427,7 +436,7 @@ export default function (pi: ExtensionAPI) {
       );
       return;
     }
-    if (allowNew && text === "/new") {
+    if (kind === "text" && text === "/new") {
       if (state.switching) return;
       const active = state.binding;
       if (!active) return;
@@ -440,7 +449,7 @@ export default function (pi: ExtensionAPI) {
       });
       return;
     }
-    activateChat(chat);
+    activateChat(chat, kind !== "media");
     if (state.switching) state.switching.pending.push({ chat, text,
       callback: state.chats.get(chat)?.callback, ws: state.ws, connection: state.connection });
     else deliver({ chat, text });
@@ -461,6 +470,8 @@ export default function (pi: ExtensionAPI) {
       const chat = state.chats.get(input.chat);
       if (chat && input.ws === state.ws && input.connection === state.connection && state.connected)
         chat.callback = input.callback;
+    }
+    for (const input of switching.pending) {
       activateChat(input.chat);
       deliver(input);
     }
@@ -533,6 +544,11 @@ export default function (pi: ExtensionAPI) {
         let body = "未发送";
         try {
           check();
+          // 排队及建泡回执期间都可能有新输入；正文发出前只使用最新位置。
+          while (source.bubble && source.bubble.inputRevision !== source.inputRevision) {
+            await openBubble(source, ws, epoch);
+            check();
+          }
           const bubble = source.bubble;
           if (bubble && (Buffer.byteLength(message, "utf8") > 20480 ||
               Date.now() - bubble.startedAt >= 10 * 60_000)) {
